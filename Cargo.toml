@@ -1,0 +1,38 @@
+[package]
+name = "metalfx_wgpu"
+version = "0.1.0"
+edition = "2024"
+categories = ["graphics", "rendering"]
+description = "Adds support for using MetalFX with wgpu"
+repository = "https://github.com/bevyengine/metalfx_wgpu"
+documentation = "https://docs.rs/metalfx_wgpu"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal"] }
+bitflags = "2"
+thiserror = "2"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MTLCommandBuffer",
+    "MTLDevice",
+    "MTLFence",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+    "MTLAllocation",
+] }
+objc2-metal-fx = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MTLFXTemporalDenoisedScaler",
+    "MTLFXTemporalScaler",
+] }
+
+[features]
+default = []
+# Export no API (for CI / non-Apple hosts). Same idea as `dlss_wgpu`'s `mock`.
+mock = []
