@@ -3,9 +3,15 @@
 //! Rust bindings for integrating Apple [MetalFX](https://developer.apple.com/documentation/metalfx)
 //! with the [`wgpu`] graphics API.
 //!
+//! ## Setup
+//! See <https://github.com/mate-h/metalfx_wgpu/blob/main/README.md>.
+//!
 //! This crate only works with wgpu's Metal backend on Apple platforms.
 //! On other targets, or with the `mock` feature, the crate exports no API
 //! (same pattern as [`dlss_wgpu`](https://crates.io/crates/dlss_wgpu) + `mock`).
+//!
+//! `MetalFxTemporalDenoisedScaler::new` rejects an output/input scale outside the device range.
+//! `render` crops oversized inputs down to the scaler's exact input size.
 //!
 //! ## API Usage
 //! ```compile_fail

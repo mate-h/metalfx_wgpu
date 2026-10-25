@@ -3,9 +3,11 @@ name = "metalfx_wgpu"
 version = "0.1.0"
 edition = "2024"
 categories = ["graphics", "rendering"]
+keywords = ["metal", "metalfx", "wgpu", "upscaling", "denoising"]
 description = "Adds support for using MetalFX with wgpu"
-repository = "https://github.com/bevyengine/metalfx_wgpu"
+repository = "https://github.com/mate-h/metalfx_wgpu"
 documentation = "https://docs.rs/metalfx_wgpu"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -39,3 +41,10 @@ objc2-metal-fx = { version = "0.3.2", default-features = false, features = [
 default = []
 # Export no API (for CI / non-Apple hosts). Same idea as `dlss_wgpu`'s `mock`.
 mock = []
+
+# The public API is cfg'd to Apple targets. docs.rs's Linux host would otherwise
+# publish an empty crate. `mock` stays off so the real API is documented.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = []
+rustdoc-args = ["--cfg", "docsrs"]
