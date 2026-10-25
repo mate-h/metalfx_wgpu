@@ -3,8 +3,13 @@ use crate::{
     hal::{halton_sequence, metal_usage_to_wgpu, retained_texture_from_view},
 };
 use bitflags::bitflags;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLOrigin,
+    MTLPixelFormat, MTLResource, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
+    MTLTextureUsage,
+};
 use objc2_metal_fx::{
     MTLFXTemporalDenoisedScaler, MTLFXTemporalDenoisedScalerBase,
     MTLFXTemporalDenoisedScalerDescriptor,
@@ -15,6 +20,13 @@ use wgpu::{
     CommandBuffer, CommandEncoder, CommandEncoderDescriptor, Device, Texture, TextureFormat,
     TextureTransition, TextureUses, TextureView, hal::api::Metal,
 };
+
+/// Required guide inputs plus the optional textures [`MetalFxTemporalDenoisedScaler::render`] may crop.
+const INPUT_SLOT_COUNT: usize = 12;
+/// Preset math rounds each axis, so scale checks allow a little slack around the device limits.
+const SCALE_EPSILON: f32 = 1e-3;
+
+type MetalTexture = Retained<ProtocolObject<dyn MTLTexture>>;
 
 /// Upscaling quality preset controlling render vs output resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -88,6 +100,16 @@ pub enum MetalFxError {
     UnsupportedFormat(TextureFormat),
     #[error("MetalFX command buffer is unavailable on the wgpu encoder")]
     MissingCommandBuffer,
+    #[error("failed to create a Metal blit encoder")]
+    MissingBlitEncoder,
+    /// `scale` is `output / input` on one axis.
+    #[error("input content scale {scale} is outside the supported range {min}..={max}")]
+    UnsupportedScale { scale: f32, min: f32, max: f32 },
+    #[error("{texture} texture: {reason}")]
+    TextureMismatch {
+        texture: &'static str,
+        reason: String,
+    },
 }
 
 /// Pixel formats for textures consumed/produced by [`MetalFxTemporalDenoisedScaler`].
@@ -128,6 +150,8 @@ pub struct MetalFxTemporalDenoisedScaler {
     upscaled_resolution: [u32; 2],
     feature_flags: MetalFxFeatureFlags,
     texture_usages: MetalFxTextureUsages,
+    /// Exact-size copies of inputs that were larger than [`Self::render_resolution`].
+    input_scratch: [Option<MetalTexture>; INPUT_SLOT_COUNT],
 }
 
 impl MetalFxTemporalDenoisedScaler {
@@ -136,7 +160,29 @@ impl MetalFxTemporalDenoisedScaler {
     /// This is an expensive operation. Cache the result and only recreate when settings change.
     ///
     /// Only call this when [`crate::FeatureSupport::temporal_denoised_scaler_supported`] is true.
+    ///
+    /// Returns [`MetalFxError::UnsupportedScale`] when either axis of `upscaled / render` is
+    /// outside the device's input-content scale range.
     pub fn new(
+        render_resolution: [u32; 2],
+        upscaled_resolution: [u32; 2],
+        formats: MetalFxTemporalDenoisedScalerFormats,
+        feature_flags: MetalFxFeatureFlags,
+        device: &Device,
+    ) -> Result<Self, MetalFxError> {
+        // MetalFX autoreleases. Bevy's render thread has no pool, so drain one here.
+        autoreleasepool(|_| {
+            Self::new_inner(
+                render_resolution,
+                upscaled_resolution,
+                formats,
+                feature_flags,
+                device,
+            )
+        })
+    }
+
+    fn new_inner(
         render_resolution: [u32; 2],
         upscaled_resolution: [u32; 2],
         formats: MetalFxTemporalDenoisedScalerFormats,
@@ -150,6 +196,37 @@ impl MetalFxTemporalDenoisedScaler {
 
         if !unsafe { MTLFXTemporalDenoisedScalerDescriptor::supportsDevice(metal_device) } {
             return Err(MetalFxError::Unsupported);
+        }
+
+        let (min_scale, max_scale) = unsafe {
+            (
+                MTLFXTemporalDenoisedScalerDescriptor::supportedInputContentMinScaleForDevice(
+                    metal_device,
+                ),
+                MTLFXTemporalDenoisedScalerDescriptor::supportedInputContentMaxScaleForDevice(
+                    metal_device,
+                ),
+            )
+        };
+        // Preset math rounds each axis, so allow a little slack around the device limits.
+        if render_resolution[0] == 0 || render_resolution[1] == 0 {
+            return Err(MetalFxError::UnsupportedScale {
+                scale: 0.0,
+                min: min_scale,
+                max: max_scale,
+            });
+        }
+        for scale in [
+            upscaled_resolution[0] as f32 / render_resolution[0] as f32,
+            upscaled_resolution[1] as f32 / render_resolution[1] as f32,
+        ] {
+            if scale + SCALE_EPSILON < min_scale || scale - SCALE_EPSILON > max_scale {
+                return Err(MetalFxError::UnsupportedScale {
+                    scale,
+                    min: min_scale,
+                    max: max_scale,
+                });
+            }
         }
 
         let descriptor = unsafe { MTLFXTemporalDenoisedScalerDescriptor::new() };
@@ -241,6 +318,7 @@ impl MetalFxTemporalDenoisedScaler {
             upscaled_resolution,
             feature_flags,
             texture_usages,
+            input_scratch: std::array::from_fn(|_| None),
         })
     }
 
@@ -249,9 +327,21 @@ impl MetalFxTemporalDenoisedScaler {
     /// Barriers are recorded on `command_encoder` via the wgpu API. MetalFX itself is encoded on a
     /// **separate** command encoder (raw Metal HAL only), matching `dlss_wgpu`.
     ///
+    /// Inputs larger than [`Self::render_resolution`] are cropped from the top-left into a private
+    /// scratch texture. MetalFX requires each input to be exactly that size, and the output to be
+    /// exactly [`Self::upscaled_resolution`].
+    ///
     /// Submit the returned [`CommandBuffer`] in the same `queue.submit` as `command_encoder.finish()`,
     /// ordered immediately afterwards.
     pub fn render(
+        &mut self,
+        render_parameters: MetalFxTemporalDenoisedScalerRenderParameters<'_>,
+        command_encoder: &mut CommandEncoder,
+    ) -> Result<CommandBuffer, MetalFxError> {
+        autoreleasepool(|_| self.render_inner(render_parameters, command_encoder))
+    }
+
+    fn render_inner(
         &mut self,
         render_parameters: MetalFxTemporalDenoisedScalerRenderParameters<'_>,
         command_encoder: &mut CommandEncoder,
@@ -288,6 +378,158 @@ impl MetalFxTemporalDenoisedScaler {
             .map(retained_texture_from_view)
             .transpose()?;
 
+        let expected = unsafe {
+            InputTextureSpec {
+                color: (
+                    self.scaler.colorTextureFormat(),
+                    self.scaler.colorTextureUsage(),
+                ),
+                depth: (
+                    self.scaler.depthTextureFormat(),
+                    self.scaler.depthTextureUsage(),
+                ),
+                motion: (
+                    self.scaler.motionTextureFormat(),
+                    self.scaler.motionTextureUsage(),
+                ),
+                diffuse_albedo: (
+                    self.scaler.diffuseAlbedoTextureFormat(),
+                    self.scaler.diffuseAlbedoTextureUsage(),
+                ),
+                specular_albedo: (
+                    self.scaler.specularAlbedoTextureFormat(),
+                    self.scaler.specularAlbedoTextureUsage(),
+                ),
+                normal: (
+                    self.scaler.normalTextureFormat(),
+                    self.scaler.normalTextureUsage(),
+                ),
+                roughness: (
+                    self.scaler.roughnessTextureFormat(),
+                    self.scaler.roughnessTextureUsage(),
+                ),
+                specular_hit_distance: (
+                    self.scaler.specularHitDistanceTextureFormat(),
+                    self.scaler.specularHitDistanceTextureUsage(),
+                ),
+                reactive_mask: (
+                    self.scaler.reactiveMaskTextureFormat(),
+                    self.scaler.reactiveTextureUsage(),
+                ),
+                denoise_strength_mask: (
+                    self.scaler.denoiseStrengthMaskTextureFormat(),
+                    self.scaler.denoiseStrengthMaskTextureUsage(),
+                ),
+                transparency_overlay: (
+                    self.scaler.transparencyOverlayTextureFormat(),
+                    self.scaler.transparencyOverlayTextureUsage(),
+                ),
+                output: (
+                    self.scaler.outputTextureFormat(),
+                    self.scaler.outputTextureUsage(),
+                ),
+            }
+        };
+
+        let mut crops = Vec::new();
+        let color = self.fit_input(0, "color", color, Some(expected.color), &mut crops)?;
+        let depth = self.fit_input(1, "depth", depth, Some(expected.depth), &mut crops)?;
+        let motion_vectors = self.fit_input(
+            2,
+            "motion",
+            motion_vectors,
+            Some(expected.motion),
+            &mut crops,
+        )?;
+        let diffuse_albedo = self.fit_input(
+            3,
+            "diffuse_albedo",
+            diffuse_albedo,
+            Some(expected.diffuse_albedo),
+            &mut crops,
+        )?;
+        let specular_albedo = self.fit_input(
+            4,
+            "specular_albedo",
+            specular_albedo,
+            Some(expected.specular_albedo),
+            &mut crops,
+        )?;
+        let normals = self.fit_input(5, "normal", normals, Some(expected.normal), &mut crops)?;
+        let roughness = self.fit_input(
+            6,
+            "roughness",
+            roughness,
+            Some(expected.roughness),
+            &mut crops,
+        )?;
+        let specular_hit_distance = specular_hit_distance
+            .map(|texture| {
+                self.fit_input(
+                    7,
+                    "specular_hit_distance",
+                    texture,
+                    Some(expected.specular_hit_distance),
+                    &mut crops,
+                )
+            })
+            .transpose()?;
+        let reactive_mask = reactive_mask
+            .map(|texture| {
+                self.fit_input(
+                    8,
+                    "reactive_mask",
+                    texture,
+                    Some(expected.reactive_mask),
+                    &mut crops,
+                )
+            })
+            .transpose()?;
+        let denoise_strength_mask = denoise_strength_mask
+            .map(|texture| {
+                self.fit_input(
+                    9,
+                    "denoise_strength_mask",
+                    texture,
+                    Some(expected.denoise_strength_mask),
+                    &mut crops,
+                )
+            })
+            .transpose()?;
+        let transparency_overlay = transparency_overlay
+            .map(|texture| {
+                self.fit_input(
+                    10,
+                    "transparency_overlay",
+                    texture,
+                    Some(expected.transparency_overlay),
+                    &mut crops,
+                )
+            })
+            .transpose()?;
+        // MetalFX has no format/usage getters for the exposure texture.
+        let exposure = exposure
+            .map(|texture| self.fit_input(11, "exposure", texture, None, &mut crops))
+            .transpose()?;
+
+        validate_texture("output", &output, expected.output.0, expected.output.1)?;
+        let output_size = [output.width() as u32, output.height() as u32];
+        if output_size != self.upscaled_resolution {
+            return Err(MetalFxError::TextureMismatch {
+                texture: "output",
+                reason: format!(
+                    "size is {output_size:?}, expected {:?}",
+                    self.upscaled_resolution
+                ),
+            });
+        }
+        if output.storageMode() != MTLStorageMode::Private {
+            return Err(MetalFxError::TextureMismatch {
+                texture: "output",
+                reason: "MetalFX requires private storage".into(),
+            });
+        }
+
         let motion_scale = render_parameters.motion_vector_scale.unwrap_or([1.0, 1.0]);
 
         unsafe {
@@ -302,8 +544,7 @@ impl MetalFxTemporalDenoisedScaler {
 
             self.scaler
                 .setSpecularHitDistanceTexture(specular_hit_distance.as_deref());
-            self.scaler
-                .setReactiveMaskTexture(reactive_mask.as_deref());
+            self.scaler.setReactiveMaskTexture(reactive_mask.as_deref());
             self.scaler
                 .setDenoiseStrengthMaskTexture(denoise_strength_mask.as_deref());
             self.scaler
@@ -316,8 +557,7 @@ impl MetalFxTemporalDenoisedScaler {
                 .setJitterOffsetY(render_parameters.jitter_offset[1]);
             self.scaler.setMotionVectorScaleX(motion_scale[0]);
             self.scaler.setMotionVectorScaleY(motion_scale[1]);
-            self.scaler
-                .setShouldResetHistory(render_parameters.reset);
+            self.scaler.setShouldResetHistory(render_parameters.reset);
             self.scaler.setDepthReversed(
                 self.feature_flags
                     .contains(MetalFxFeatureFlags::DEPTH_REVERSED),
@@ -325,13 +565,16 @@ impl MetalFxTemporalDenoisedScaler {
             self.scaler.setPreExposure(render_parameters.pre_exposure);
         }
 
+        let input_resolution = self.render_resolution;
+        let scaler = &self.scaler;
+
         // Encode MetalFX on a dedicated encoder so we never mix wgpu + raw HAL APIs
         // on the caller's encoder (wgpu panics if you do).
-        let mut metal_fx_encoder =
-            self.device
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("metal_fx_temporal_denoised_scaler"),
-                });
+        let mut metal_fx_encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("metal_fx_temporal_denoised_scaler"),
+            });
         unsafe {
             metal_fx_encoder.as_hal_mut::<Metal, _, _>(|hal_encoder| {
                 let Some(hal_encoder) = hal_encoder else {
@@ -340,12 +583,37 @@ impl MetalFxTemporalDenoisedScaler {
                 let Some(command_buffer) = hal_encoder.raw_command_buffer() else {
                     return Err(MetalFxError::MissingCommandBuffer);
                 };
-                self.scaler.encodeToCommandBuffer(command_buffer);
+                if !crops.is_empty() {
+                    let Some(blit) = command_buffer.blitCommandEncoder() else {
+                        return Err(MetalFxError::MissingBlitEncoder);
+                    };
+                    let origin = MTLOrigin { x: 0, y: 0, z: 0 };
+                    let size = MTLSize {
+                        width: input_resolution[0] as usize,
+                        height: input_resolution[1] as usize,
+                        depth: 1,
+                    };
+                    for (source, scratch) in &crops {
+                        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            source,
+                            0,
+                            0,
+                            origin,
+                            size,
+                            scratch,
+                            0,
+                            0,
+                            origin,
+                        );
+                    }
+                    blit.endEncoding();
+                }
+                scaler.encodeToCommandBuffer(command_buffer);
                 Ok(())
             })?;
         }
 
-        // Keep retained textures alive until MetalFX has been encoded.
+        // wgpu still owns the source textures. Scratch copies stay in `input_scratch`.
         drop((
             color,
             depth,
@@ -360,9 +628,73 @@ impl MetalFxTemporalDenoisedScaler {
             denoise_strength_mask,
             transparency_overlay,
             exposure,
+            crops,
         ));
 
         Ok(metal_fx_encoder.finish())
+    }
+
+    /// Return `source` when it is already the input size. Crop the top-left when it is larger.
+    fn fit_input(
+        &mut self,
+        slot: usize,
+        name: &'static str,
+        source: MetalTexture,
+        expected: Option<(MTLPixelFormat, MTLTextureUsage)>,
+        crops: &mut Vec<(MetalTexture, MetalTexture)>,
+    ) -> Result<MetalTexture, MetalFxError> {
+        if let Some((format, usage)) = expected {
+            validate_texture(name, &source, format, usage)?;
+        }
+        let size = [source.width() as u32, source.height() as u32];
+        let input = self.render_resolution;
+        if size == input {
+            return Ok(source);
+        }
+        if size[0] >= input[0] && size[1] >= input[1] {
+            let (format, usage) =
+                expected.unwrap_or_else(|| (source.pixelFormat(), source.usage()));
+            let scratch = self.scratch_texture(slot, name, &source, format, usage)?;
+            crops.push((source, scratch.clone()));
+            return Ok(scratch);
+        }
+        Err(MetalFxError::TextureMismatch {
+            texture: name,
+            reason: format!("size is {size:?}, smaller than the input size {input:?}"),
+        })
+    }
+
+    fn scratch_texture(
+        &mut self,
+        slot: usize,
+        name: &'static str,
+        source: &ProtocolObject<dyn MTLTexture>,
+        format: MTLPixelFormat,
+        usage: MTLTextureUsage,
+    ) -> Result<MetalTexture, MetalFxError> {
+        if let Some(existing) = &self.input_scratch[slot] {
+            return Ok(existing.clone());
+        }
+        let [width, height] = self.render_resolution;
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                format,
+                width as usize,
+                height as usize,
+                false,
+            )
+        };
+        descriptor.setUsage(usage);
+        descriptor.setStorageMode(MTLStorageMode::Private);
+        let texture = source
+            .device()
+            .newTextureWithDescriptor(&descriptor)
+            .ok_or_else(|| MetalFxError::TextureMismatch {
+                texture: name,
+                reason: "failed to allocate a scratch texture for cropping".into(),
+            })?;
+        self.input_scratch[slot] = Some(texture.clone());
+        Ok(texture)
     }
 
     /// Suggested subpixel camera jitter for a given frame.
@@ -457,6 +789,50 @@ impl<'a> MetalFxTemporalDenoisedScalerRenderParameters<'a> {
     }
 }
 
-fn map_format(format: TextureFormat) -> Result<objc2_metal::MTLPixelFormat, MetalFxError> {
+struct InputTextureSpec {
+    color: (MTLPixelFormat, MTLTextureUsage),
+    depth: (MTLPixelFormat, MTLTextureUsage),
+    motion: (MTLPixelFormat, MTLTextureUsage),
+    diffuse_albedo: (MTLPixelFormat, MTLTextureUsage),
+    specular_albedo: (MTLPixelFormat, MTLTextureUsage),
+    normal: (MTLPixelFormat, MTLTextureUsage),
+    roughness: (MTLPixelFormat, MTLTextureUsage),
+    specular_hit_distance: (MTLPixelFormat, MTLTextureUsage),
+    reactive_mask: (MTLPixelFormat, MTLTextureUsage),
+    denoise_strength_mask: (MTLPixelFormat, MTLTextureUsage),
+    transparency_overlay: (MTLPixelFormat, MTLTextureUsage),
+    output: (MTLPixelFormat, MTLTextureUsage),
+}
+
+fn validate_texture(
+    name: &'static str,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    format: MTLPixelFormat,
+    usage: MTLTextureUsage,
+) -> Result<(), MetalFxError> {
+    let mismatch = |reason: String| MetalFxError::TextureMismatch {
+        texture: name,
+        reason,
+    };
+    if texture.pixelFormat() != format {
+        return Err(mismatch(format!(
+            "pixel format is {:?}, expected {format:?}",
+            texture.pixelFormat()
+        )));
+    }
+    if !texture.usage().contains(usage) {
+        return Err(mismatch(format!(
+            "usage {:?} is missing {:?}",
+            texture.usage(),
+            usage
+        )));
+    }
+    if texture.sampleCount() != 1 {
+        return Err(mismatch("must not be multisampled".into()));
+    }
+    Ok(())
+}
+
+fn map_format(format: TextureFormat) -> Result<MTLPixelFormat, MetalFxError> {
     texture_format_to_metal(format).ok_or(MetalFxError::UnsupportedFormat(format))
 }
